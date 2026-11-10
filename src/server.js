@@ -39,6 +39,7 @@ import * as artifactRevisions from "./artifact-revisions.js";
 import * as mermaidNode from "./mermaid-node.js";
 import * as tableCellHelpers from "./table-cell.js";
 import { extractMermaidSources, whiteboardSourceHash } from "./mermaid-source.js";
+import { buildFeedbackHookPayload, createFeedbackHookDelivery, describeFeedbackWebhook } from "./feedback-hook.js";
 import { createExcalidrawLibraryCache, excalidrawLibrariesDir } from "./whiteboard-library-store.js";
 import { parseLibraryIconDirectives } from "./whiteboard-libraries.js";
 import {
@@ -310,6 +311,7 @@ export async function serve({
   extraListenHosts = [],
   bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
+  feedbackHook = null,
 } = {}) {
   // Keep the transport dependency off fast metadata paths such as `--version`.
   const { WebSocket, WebSocketServer } = await import("ws");
@@ -370,6 +372,23 @@ export async function serve({
       : (line) => process.stderr.write(`${serverStdioIsTimestamped() ? line : formatServerLogLine(line)}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   if (tailscaleDetectionWarning) writeLog(`[lavish] WARNING: ${tailscaleDetectionWarning}`);
+  // The push lane (docs/invariants.md#feedback-hook-push-lane). It is created once per server from
+  // operator config, never from anything a request can influence, and it names only the channel and
+  // the webhook origin: a webhook path or query can itself be the secret.
+  const feedbackHookDelivery = createFeedbackHookDelivery(feedbackHook, {
+    userAgent: version ? `lavish-axi/${version}` : "lavish-axi",
+    retryDelayMs: feedbackHook?.retryDelayMs,
+    timeoutMs: feedbackHook?.timeoutMs,
+    logFailure: (line) => writeLog(`[lavish] ${line}`),
+    logSuccess: logEvent ? (line) => logEvent(line) : null,
+  });
+  if (feedbackHookDelivery) {
+    const channels = [
+      feedbackHook?.webhook ? `webhook ${describeFeedbackWebhook(feedbackHook.webhook)}` : "",
+      feedbackHook?.command ? `command ${feedbackHook.command[0]}` : "",
+    ].filter(Boolean);
+    writeLog(`[lavish] feedback hook enabled (${channels.join(", ")})`);
+  }
   let publicPort = port;
   let serverReady = false;
   let networkReconcileCheckedAt = 0;
@@ -1189,6 +1208,8 @@ export async function serve({
         return;
       }
       const freshFeedback = session.fresh_feedback === true;
+      // What this send appended, in the exact form `/api/poll` would hand it to the agent.
+      const hookBatch = Array.isArray(session.accepted_prompts) ? session.accepted_prompts : [];
       if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       let publishedSession = session;
       if (hasLayoutWarningPrompt) {
@@ -1207,6 +1228,23 @@ export async function serve({
         pending_prompts: publishedSession.pending_prompts,
         ...serializeChatSync(publishedSession),
       });
+      if (freshFeedback && hookBatch.length > 0 && feedbackHookDelivery) {
+        // The push lane fires only for the batch this send appended: an already-queued note arriving
+        // again through a stale bubble re-POST, a replayed whiteboard note, or a disconnected-poll
+        // `restore` re-emission would otherwise hand the same note to the hook a second time. Never
+        // awaited: a slow, broken, or hanging hook must not delay, block, or undo this send, and this
+        // batch stays in the poll queue exactly as it was - the hook is additional, never a replacement.
+        try {
+          void feedbackHookDelivery.deliver(
+            buildFeedbackHookPayload({ key: req.params.key, session: publishedSession, prompts: hookBatch }),
+          );
+        } catch (error) {
+          writeLog(
+            `[lavish] feedback hook could not start for this send: ${error instanceof Error ? error.message : String(error)}. The note is still queued for \`lavish-axi poll\`.`,
+          );
+        }
+      }
+
       if (shouldEndSession) await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);

@@ -338,7 +338,15 @@ export class SessionStore {
     if (shouldEndSession) session.ended_by = "user";
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
-    return { ...session, fresh_feedback: !restoring && acceptedPrompts.length > 0 };
+    // `accepted_prompts` is the batch this call appended, in the form the agent-facing queue carries
+    // it (prompt_id stripped, attachments resolved): the feedback hook delivers a send as it is
+    // accepted and must send exactly what a poll would hand out for it. `restore` re-emits the batch
+    // it is replaying, which `fresh_feedback: false` already marks as not a delivery.
+    return {
+      ...session,
+      fresh_feedback: !restoring && acceptedPrompts.length > 0,
+      accepted_prompts: storedPrompts,
+    };
   }
 
   async issueReviewerHandoff(key) {

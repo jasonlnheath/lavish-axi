@@ -65,6 +65,8 @@ Each line is the rule. [docs/invariants.md](docs/invariants.md) has the failure 
 - Only agent chat entries render as HTML. User entries are always escaped. [Request flow](docs/invariants.md#request-flow).
 - A note's Sending state is derived from the existing send bookkeeping, never tracked separately. [Request flow](docs/invariants.md#request-flow).
 - `/api/:key/prompts` rejects every new batch for an ended session. Only the internal `restore` replay is exempt. [Request flow](docs/invariants.md#request-flow).
+- The feedback hook is additional: it fires once per fresh accepted send, is never awaited by the Send route, and never replaces, consumes, or marks the delivery the poll lane still owes. [Feedback hook (push lane)](docs/invariants.md#feedback-hook-push-lane).
+- Feedback hook configuration belongs to the server (`lavish-axi server` flags or `LAVISH_AXI_FEEDBACK_*`), never to a board command, and `--feedback-cmd` is never run through a shell. [Feedback hook (push lane)](docs/invariants.md#feedback-hook-push-lane).
 - A session the user ended never reopens without explicit opt-in (`reopen: true`, the CLI's `--reopen`). [Request flow](docs/invariants.md#request-flow).
 - Poll ownership is exclusive per session in `activePolls`. Takeover installs the new holder before releasing the old one, and claims, including the reply write, serialize through `pollOwnershipLock`. [Request flow](docs/invariants.md#request-flow).
 - Every poll exit path undoes the presence it set and cancels the disconnect grace timer. `/api/poll` subscribes to closure before its first `await`. [Request flow](docs/invariants.md#request-flow).
