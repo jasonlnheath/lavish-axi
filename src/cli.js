@@ -25,6 +25,7 @@ import {
   exportWarningSummaries,
   splitExportWarnings,
 } from "./export-bundle.js";
+import { FeedbackHookConfigError, resolveFeedbackHookConfig } from "./feedback-hook.js";
 import {
   createUnpublishedPageHtml,
   hostRejectedShareWrite,
@@ -66,6 +67,9 @@ import { initDefaultTelemetry } from "./telemetry.js";
 import { excalidrawLibrariesDir, loadExcalidrawLibraries } from "./whiteboard-library-store.js";
 
 const SHARE_VALUE_FLAGS = ["--password", "--token", "--site", "--update-key"];
+// The feedback hook is server-wide operator configuration, so these belong to `lavish-axi server`
+// only: a per-board flag would quietly make which hook a note reaches depend on whoever opened it.
+const FEEDBACK_HOOK_FLAGS = ["--feedback-webhook", "--feedback-cmd", "--feedback-hook-env"];
 const COMMANDS = new Set([
   "open",
   "poll",
@@ -196,6 +200,7 @@ export async function run(argv) {
   }
   await ensureStateDir();
   const normalizedArgv = normalizeArgv(argv);
+  refuseFeedbackHookFlags(normalizedArgv);
   const agent = detectInvokingAgent(process.env);
   const isTopLevelHelp = argv.length === 1 && argv[0] === "--help";
   const command = telemetryCommandName(argv);
@@ -266,6 +271,25 @@ export function normalizeArgv(argv) {
     return argv.some((arg) => isHtmlPath(arg)) ? ["open", ...argv] : argv;
   }
   return ["open", ...argv];
+}
+
+// A feedback hook flag anywhere but `server` would be a silent no-op: the hook belongs to the server
+// that accepts the send, not to the board being opened or polled. Keeping the configuration in one
+// place also means which hook a note reaches never depends on whichever agent opened that board.
+export function refuseFeedbackHookFlags(args) {
+  const command = args[0] && !args[0].startsWith("-") ? args[0] : "open";
+  if (command === "server") return;
+  const flag = args.find((arg) => FEEDBACK_HOOK_FLAGS.some((name) => arg === name || arg.startsWith(`${name}=`)));
+  if (!flag) return;
+  throw new AxiError(
+    `${flag} configures the feedback hook, which belongs to the Lavish server, not to \`lavish-axi ${command}\``,
+    "VALIDATION_ERROR",
+    [
+      'Configure it where the server starts: `lavish-axi server --feedback-webhook <url> --feedback-cmd "<program> [args...]" --feedback-hook-env <KEY[=VALUE]>`',
+      "For a server Lavish starts or replaces for you, set LAVISH_AXI_FEEDBACK_WEBHOOK or LAVISH_AXI_FEEDBACK_CMD in that process's environment instead - a flag on this command configures one send, and the hook is not per-board",
+      "Run `lavish-axi server --help` for the hook flags",
+    ],
+  );
 }
 
 export function telemetryCommandName(argv) {
@@ -1727,9 +1751,82 @@ async function serverCommand(args) {
     version: VERSION,
     debug,
     extraListenHosts: flagValues(args, "--also-listen"),
+    feedbackHook: feedbackHookConfigFromArgs(args),
   });
   await server.done;
   return "";
+}
+
+/**
+ * The hook is configured by flags on this invocation, or by the environment of the process that
+ * starts the server - which is the only channel that survives a server Lavish auto-starts or
+ * replaces on the user's behalf.
+ *
+ * @param {string[]} args
+ * @returns {import("./feedback-hook.js").ResolvedFeedbackHook | null}
+ */
+export function feedbackHookConfigFromArgs(args) {
+  try {
+    return resolveFeedbackHookConfig({
+      webhookFlag: feedbackHookFlagValue(args, "--feedback-webhook"),
+      commandFlag: feedbackHookFlagValue(args, "--feedback-cmd"),
+      hookEnvFlags: feedbackHookEnvValues(args),
+      env: process.env,
+    });
+  } catch (error) {
+    if (error instanceof FeedbackHookConfigError) {
+      throw new AxiError(error.message, "VALIDATION_ERROR", error.suggestions);
+    }
+    throw error;
+  }
+}
+
+// Mirrors `shareFlagValue`: an unset shell variable makes `--feedback-cmd $CMD` an empty value, and
+// an unquoted value that starts with `--` would be swallowed as the next flag.
+function feedbackHookFlagValue(args, flag) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--") break;
+    if (arg === flag) return checkedFeedbackHookFlagValue(flag, args[i + 1], { swallows: true });
+    if (arg.startsWith(`${flag}=`)) return checkedFeedbackHookFlagValue(flag, arg.slice(flag.length + 1), {});
+  }
+  return null;
+}
+
+function checkedFeedbackHookFlagValue(flag, value, { swallows = false }) {
+  if (swallows && typeof value === "string" && value.startsWith("--")) {
+    throw new AxiError(
+      `${flag} was given no value: the next argument ${value} is another flag, so it would have been used as the value`,
+      "VALIDATION_ERROR",
+      [`Quote the value as ${flag} "<value>"`, `Use ${flag}=<value> if the value itself starts with --`],
+    );
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    throw new AxiError(
+      `${flag} was given no value. Quote it as ${flag} "<value>" - an unquoted shell variable that is unset expands to nothing`,
+      "VALIDATION_ERROR",
+      ["Run `lavish-axi server --help` for the feedback hook flags"],
+    );
+  }
+  return value;
+}
+
+function feedbackHookEnvValues(args) {
+  const flag = "--feedback-hook-env";
+  const values = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--") break;
+    if (arg === flag) {
+      // No `swallows` refusal here on purpose: `--feedback-hook-env <KEY> --feedback-cmd ...` is the
+      // ordinary way to name a key and then move on. A value that is actually the next flag fails the
+      // name check below with a message that says which name it tried to use.
+      values.push(checkedFeedbackHookFlagValue(flag, args[i + 1], {}));
+    } else if (arg.startsWith(`${flag}=`)) {
+      values.push(checkedFeedbackHookFlagValue(flag, arg.slice(flag.length + 1), {}));
+    }
+  }
+  return values;
 }
 
 async function visibleSessions() {
@@ -2642,7 +2739,7 @@ function createCommandHelp({ agent = "generic" } = {}) {
     libraries: `Usage: lavish-axi libraries [--search <text>] [--library <id>]\n\nList the Excalidraw libraries (.excalidrawlib files) the user copied into ~/.lavish-axi/excalidraw-libraries, or LAVISH_AXI_STATE_DIR/excalidraw-libraries when set. Their items appear in every whiteboard's library panel. --search lists item refs whose ref contains every search word; --library lists one library's item refs. Lavish only reads this directory and never downloads libraries.\n\nExamples:\n  lavish-axi libraries\n  lavish-axi libraries --search lambda\n  lavish-axi libraries --library aws-architecture-icons\n`,
     design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, the whiteboard (Mermaid) opt-in snippet, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,
     setup: `Usage: lavish-axi setup hooks\n       lavish-axi setup plugin\n\nhooks: install or repair agent SessionStart hooks for lavish-axi ambient context in Claude Code, Codex, OpenCode, and GitHub Copilot CLI. Restart your agent session afterward to receive the context. This is the primary integration - it carries live session state.\n\nplugin: register the installed lavish-axi package as an Agent Plugin (agent-plugins.org) in VS Code, Cursor, and GitHub Copilot CLI. The installed package directory is itself the plugin root, so nothing is downloaded and no marketplace is involved. Reload each client afterward. Codex users should use \`setup hooks\` instead.\n\nBoth actions are explicit opt-in, idempotent, and repair a stale path after a reinstall.\n`,
-    server: `Usage: lavish-axi server [--port 4387] [--verbose] [--also-listen <host>...]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup and crash diagnostics.\n\nBy default Lavish binds to 127.0.0.1 and, when Tailscale is running, this machine's Tailscale IPv4. Any explicit LAVISH_AXI_HOST overrides automatic Tailscale binding; wildcard values such as 0.0.0.0 or :: are restricted to loopback. An explicit non-wildcard LAVISH_AXI_HOST sets the bind address, and the server also listens on 127.0.0.1 so every local CLI finds it; --also-listen adds further concrete addresses (the CLI passes it when it replaces a server, to keep every address the old one served). An address that cannot be bound is retried in the background and reported as network_warning. Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. With automatic binding enabled, a successfully bound Tailscale listener uses its MagicDNS name in generated session links; otherwise LAVISH_AXI_LINK_HOST can set the link hostname. See README's Allowed hosts section for Host allowlisting and LAVISH_AXI_ALLOWED_HOSTS. LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
+    server: `Usage: lavish-axi server [--port 4387] [--verbose] [--also-listen <host>...] [--feedback-webhook <url>] [--feedback-cmd "<program> [args...]"] [--feedback-hook-env <KEY[=VALUE]>...]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup and crash diagnostics.\n\nA feedback hook pushes a review note the moment the browser sends it, so delivery no longer depends on an agent currently holding \`lavish-axi poll\` for that board. --feedback-webhook <url> POSTs the batch as JSON to an http(s) endpoint you run; --feedback-cmd "<program> [args...]" runs a local program with the same JSON on stdin (no shell runs it, so $VAR is never expanded - quote the whole command as one argument). --feedback-hook-env is repeatable and gives a --feedback-cmd hook extra environment: KEY=VALUE sets it inline, and a bare KEY carries this server's own value for that name, which is how a signing secret stays out of every process listing. Both channels deliver the same object a poll hands the agent for that batch: \`session\` (file, key, status "feedback", plus \`session_ended\` and \`ended_by\` when the note ended the session), \`prompts\` (each with \`prompt\`, \`selector\`, \`tag\`, \`text\`, and any resolved attachments), \`dom_snapshot\`, and the server's accept time \`at\`.\n\nDelivery is additional and best-effort, never a replacement: the batch stays queued for \`lavish-axi poll\`, no hook delays or blocks that queue or the Send itself, a hook that fails only logs, each delivery retries at most once, and a batch that merely arrives again (a stale browser bubble, or a disconnected poll handing its taken batch back through \`restore\`) never re-fires a hook. The hook never marks a note Delivered or Done - that bookkeeping belongs to the poll lane. These flags belong to this command only: on any other command they are refused rather than silently ignored, because which hook a note reaches must not depend on whichever agent opened that board. LAVISH_AXI_FEEDBACK_WEBHOOK and LAVISH_AXI_FEEDBACK_CMD configure the same hook from the environment, which is the only channel that survives a server Lavish auto-starts or replaces for you - a hook configured by flag lives exactly as long as the server you started with that flag. See the README's Feedback hooks section.\n\nBy default Lavish binds to 127.0.0.1 and, when Tailscale is running, this machine's Tailscale IPv4. Any explicit LAVISH_AXI_HOST overrides automatic Tailscale binding; wildcard values such as 0.0.0.0 or :: are restricted to loopback. An explicit non-wildcard LAVISH_AXI_HOST sets the bind address, and the server also listens on 127.0.0.1 so every local CLI finds it; --also-listen adds further concrete addresses (the CLI passes it when it replaces a server, to keep every address the old one served). An address that cannot be bound is retried in the background and reported as network_warning. Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. With automatic binding enabled, a successfully bound Tailscale listener uses its MagicDNS name in generated session links; otherwise LAVISH_AXI_LINK_HOST can set the link hostname. See README's Allowed hosts section for Host allowlisting and LAVISH_AXI_ALLOWED_HOSTS. LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
   };
 }
 
