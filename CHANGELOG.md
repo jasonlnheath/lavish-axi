@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.97](https://github.com/jasonlnheath/lavish-axi/compare/lavish-axi-v0.1.96...lavish-axi-v0.1.97) (2026-11-16)
+
+
+### Features
+
+* **server:** push accepted feedback to a hook the moment the browser sends it ([#1](https://github.com/jasonlnheath/lavish-axi/issues/1)) ([4f98aca](https://github.com/jasonlnheath/lavish-axi/commit/4f98aca97221a25cfe0950b978cfb96ee8185dde))
+
 ## [0.1.96](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.95...lavish-axi-v0.1.96) (2026-10-29)
 
 
