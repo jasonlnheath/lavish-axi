@@ -10353,6 +10353,7 @@ test("a failed draft save says the notes are only in this tab until a save is co
   for (let i = 0; i < 4; i += 1) await flushPromises();
   assert.equal(chrome.draftRequests.length, 3, "each change retries");
   assert.equal(banner.hidden, true, "a confirmed save clears it");
+});
 // The media rules chrome.css carries, as the CSSOM exposes them. The lock rewrites `mediaText`.
 function chromeCssSheet(href = "http://lavish.test/chrome.css") {
   const texts = [
