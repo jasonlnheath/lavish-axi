@@ -34,7 +34,9 @@ queued ──send──> sent ──poll takes it──> seen ──artifact cha
  (tab)          (server)                 (agent)                    (agent)                  (agent)
 ```
 
-- **queued**: in the tab only (dashed bubble). Unchanged.
+- **queued**: the tab's alone as far as delivery goes (dashed bubble); the tab also mirrors it to the
+  server as an unsent draft ([Request flow](invariants.md#request-flow)), which never enters this
+  pipeline. Unchanged.
 - **sent**: a `role: "user"` chat entry with no `delivered_at`. The bubble says why it has not been
   seen, from the live presence the chrome already holds: "No agent is listening" (`waiting`),
   "Agent is busy; delivered on its next poll" (`working` / external listener), or "Delivering"
