@@ -9,7 +9,7 @@ process.env.LAVISH_AXI_HOST = "127.0.0.1";
 process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
 
 import { serve } from "../src/server.js";
-import { sessionKey } from "../src/session-store.js";
+import { canonicalFile, sessionKey } from "../src/session-store.js";
 
 // The operator's receiver, standing in for firstmate's inbox writer: it records every payload it is
 // handed to a file the test can read, and it can be told to refuse.
@@ -94,7 +94,10 @@ async function openSession(base, file) {
     body: JSON.stringify({ file }),
   });
   const body = await response.json();
-  assert.equal(body.key, sessionKey(file));
+  // The server canonicalizes `file` with `realpath` before keying the session, so the expected key
+  // must come from the same canonical path: on macOS `/var` realpaths to `/private/var` and on
+  // Windows `os.tmpdir()` can carry an 8.3 short name, and the raw spelling hashes differently.
+  assert.equal(body.key, sessionKey(await canonicalFile(file)));
   return body.key;
 }
 
@@ -167,7 +170,7 @@ test("a Send fires the hook with the accepted batch, and the same batch is still
     assert.equal(queued.body.pending_prompts, 2);
 
     const [hook] = await waitForHookRecords(record, 1);
-    assert.equal(hook.session.file, artifact);
+    assert.equal(hook.session.file, await canonicalFile(artifact));
     assert.equal(hook.session.key, key);
     assert.equal(hook.session.status, "feedback");
     assert.ok(!("session_ended" in hook.session), "a plain Send does not end the session");
