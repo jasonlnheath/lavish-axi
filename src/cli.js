@@ -44,6 +44,7 @@ import {
   LOOPBACK_HOST,
   resolveConcreteListenHosts,
   serverLogFile,
+  stateDir,
   stateFile,
   stateId,
 } from "./paths.js";
@@ -100,7 +101,7 @@ export const POLL_WAKE_PATH_RULES = Object.freeze([
   "If it returns browser_disconnected, the review window stayed disconnected past its reconnect grace period but the session remains resumable; ask the user whether to reopen or end it, and do neither uninvited.",
 ]);
 export const POLL_SEND_AND_END_RULE =
-  "`Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.";
+  '`Send & End` ends the session. Its final feedback is still delivered once. With no comment, it delivers "Review accepted. No comments.", which means the user accepts the review as-is. After that response, polling stops, and the agent must not reopen the session uninvited.';
 export const POLL_AGENT_REPLY_RULE =
   "Keep the reply concise. Only when a longer reply is genuinely necessary, use Markdown structure - blank-line paragraphs, `- ` / `1. ` lists, `## ` headings - so it renders scannably instead of a wall of text, and pass that body with `--agent-reply-file <path>` (`-` reads stdin) so newlines survive quoting.";
 const POLL_AGENT_REPLY_HELP_POINTER =
@@ -2371,10 +2372,16 @@ export function createServerSpawnOptions(logFd = null) {
   const stdio = /** @type {import("node:child_process").StdioOptions} */ (
     logFd === null ? "ignore" : ["ignore", logFd, logFd]
   );
+  // The server is shared machine-wide, so it must not pin the first caller's folder: tools that
+  // reap processes by working directory when deleting a worktree would stop every open session.
+  // The state dir is passed absolute so a relative LAVISH_AXI_STATE_DIR is not re-resolved
+  // against that new cwd.
+  const dir = path.resolve(stateDir());
   return {
     detached: true,
     stdio,
-    env: { ...process.env, LAVISH_AXI_NO_OPEN: "1" },
+    cwd: dir,
+    env: { ...process.env, LAVISH_AXI_STATE_DIR: dir, LAVISH_AXI_NO_OPEN: "1" },
   };
 }
 

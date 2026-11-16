@@ -16,9 +16,28 @@ const reviewStateStorageKey = "lavish-axi:review-state:" + key;
 // Drafts Lavish could not replay. The text outlives the draft that carried it, so the user can
 // still read and copy it after the anchor it was written against is gone for good.
 const retiredDraftStorageKey = "lavish-axi:retired-drafts:" + key;
+// This tab's identity for the server-side copy of its unsent notes. Kept in sessionStorage so a
+// reload of the same tab rewrites its own record instead of adding a second one (loadDraftTabId).
+const draftTabStorageKey = "lavish-axi:draft-tab:" + key;
+// Set only while this tab's last local write of its queue and card state succeeded. A reload
+// trusts its local copy over its own server record only then; storage that filled up can keep
+// the small tab id while the newest notes reached only the server.
+const draftLocalSavedStorageKey = "lavish-axi:draft-local-saved:" + key;
+const localDraftSavedAtBoot = loadJsonState(draftLocalSavedStorageKey, false) === true;
+const localDraftWriteOk = { queue: true, reviewState: true };
+// Unsent notes other tabs left on the server. Closing a tab (or an in-app browser discarding it)
+// used to lose its queue; a tab opened later now adopts it.
+const initialDrafts = Array.isArray(sessionData.initialDrafts) ? sessionData.initialDrafts : [];
+const DRAFT_SAVE_DEBOUNCE_MS = 400;
+// The server keeps at most this many notes per tab record (src/review-drafts.js), so a tab never
+// retires a record whose notes it could not all hold.
+const draftMaxPrompts = Number(sessionData.draftMaxPrompts) || Infinity;
+// Browsers cap the bodies of in-flight keepalive requests at 64 KiB in total.
+const DRAFT_KEEPALIVE_MAX_BYTES = 60_000;
 /** @type {any[]} */
 const retiredDraftNodes = [];
 const internalQueueKeyField = "_lavishQueueKey";
+const acceptancePromptField = "_lavishAcceptance";
 const promptIdentityField = "prompt_id";
 const PROMPT_IDENTITY_MAX = 128;
 const PROMPT_IDENTITY_RE = /^[A-Za-z0-9_-]+$/;
@@ -161,6 +180,7 @@ const presenceBanner = /** @type {HTMLDivElement} */ (document.getElementById("p
 const handoffBanner = /** @type {HTMLDivElement} */ (document.getElementById("handoffBanner"));
 const handoffTakeoverButton = /** @type {HTMLButtonElement} */ (document.getElementById("handoffTakeover"));
 const outdatedBanner = /** @type {HTMLDivElement} */ (document.getElementById("outdatedBanner"));
+const draftSaveBanner = /** @type {HTMLDivElement} */ (document.getElementById("draftSaveBanner"));
 const outdatedText = /** @type {HTMLSpanElement} */ (document.getElementById("outdatedText"));
 const outdatedReloadButton = /** @type {HTMLButtonElement} */ (document.getElementById("outdatedReload"));
 const outdatedDismissButton = /** @type {HTMLButtonElement} */ (document.getElementById("outdatedDismiss"));
@@ -200,6 +220,13 @@ let annotationOverridden = false;
 let annotationDefaultReceived = false;
 let ended = false;
 let agentPresence = "waiting";
+// The phone dock and the collapsed desktop toggle summarize trouble the open panel would show,
+// because on a phone the panel is a closed sheet and its warnings are otherwise invisible. The
+// summary reads state declared further down this file, so it stays quiet until boot reaches it.
+let dockSummaryReady = false;
+let lastDockAlertKey = "";
+let handoffSupersededVisible = false;
+let chromeOutdatedVisible = false;
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -313,6 +340,7 @@ const SEND_FAILED_COPY =
   "Could not send. Your feedback is still queued in this tab. Check that Lavish is running, then click Send to Agent to retry.";
 const TERMINAL_SEND_FAILED_COPY =
   "Could not send. Your terminal feedback is still queued in this tab. Check that Lavish is running, then click Send & End to retry the same batch.";
+const EMPTY_END_FAILED_COPY = "Could not end the review. Nothing was sent. Click Send & End to try again.";
 const HEALTH_NO_ANSWER_TITLE = "Lavish did not answer.";
 const HEALTH_NO_ANSWER_COPY =
   "Lavish did not answer the check, so this page cannot tell whether it is running. Try again in a moment.";
@@ -348,6 +376,17 @@ function artifactFrameSrcForLoad(load) {
     "&artifact_load_token=" +
     encodeURIComponent(load.token)
   );
+}
+
+// Assigning `src` to an iframe that already holds a document adds a session-history entry to the
+// tab, so every live reload grew `history.length` until Chromium refused `window.close()` (#426).
+// After the first load, replace the frame's location instead; the `src` attribute keeps that URL.
+function navigateArtifactFrame(url) {
+  if (frame.src && frame.contentWindow) {
+    frame.contentWindow.location.replace(url);
+    return;
+  }
+  frame.src = url;
 }
 
 function escapeHtml(value) {
@@ -446,7 +485,10 @@ function assignPromptIdentity(prompt, keepExisting) {
 function adoptQueuedPrompt(rawPrompt, keepIdentity) {
   const prompt = sanitizeQueuedPrompt(rawPrompt);
   if (!prompt) return null;
-  if (!keepIdentity) delete prompt[promptIdentityField];
+  if (!keepIdentity) {
+    delete prompt[promptIdentityField];
+    delete prompt[acceptancePromptField];
+  }
   assignPromptIdentity(prompt, true);
   return prompt;
 }
@@ -475,15 +517,265 @@ function loadQueuedPrompts() {
 }
 
 function persistQueuedPrompts() {
+  persistQueuedPromptsLocally();
+  // The tab's sessionStorage dies with the tab; the server copy is what a reopened link restores.
+  saveDraftsNow();
+}
+
+function persistQueuedPromptsLocally() {
   try {
     if (queued.length) {
       sessionStorage.setItem(queueStorageKey, JSON.stringify(queued));
     } else {
       sessionStorage.removeItem(queueStorageKey);
     }
+    noteLocalDraftWrite("queue", true);
   } catch {
     // The in-memory queue still works if browser storage is unavailable.
+    noteLocalDraftWrite("queue", false);
   }
+}
+
+function noteLocalDraftWrite(part, ok) {
+  localDraftWriteOk[part] = ok;
+  try {
+    if (localDraftWriteOk.queue && localDraftWriteOk.reviewState)
+      sessionStorage.setItem(draftLocalSavedStorageKey, "true");
+    else sessionStorage.removeItem(draftLocalSavedStorageKey);
+  } catch {
+    // Without the marker a reload merges its own server record, which is the safe direction.
+  }
+}
+
+// Only a reload is the same tab. A duplicated tab inherits a copy of sessionStorage, so any
+// other load mints its own id and adopts the stored one's record like any other tab's.
+function loadDraftTabId() {
+  try {
+    const stored = sessionStorage.getItem(draftTabStorageKey);
+    if (isPromptIdentity(stored) && pageLoadIsReload()) return stored;
+  } catch {
+    // Fall through to a fresh id; this tab then simply writes a new record.
+  }
+  const id = createPromptIdentity().replace(/[^A-Za-z0-9_-]/g, "");
+  try {
+    sessionStorage.setItem(draftTabStorageKey, id);
+  } catch {
+    // Without storage a reload mints another id; the server bounds the records it keeps.
+  }
+  return id;
+}
+
+function pageLoadIsReload() {
+  try {
+    const entry = /** @type {PerformanceNavigationTiming | undefined} */ (
+      performance.getEntriesByType("navigation")[0]
+    );
+    return entry?.type === "reload";
+  } catch {
+    return false;
+  }
+}
+
+let draftTabId = "";
+/** @type {{ tab: string, seq: number, review_state: boolean }[]} */
+let draftAdoptedTabs = [];
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let draftSaveTimer;
+let draftSaveInFlight = false;
+let draftSaveAgain = false;
+// Grows with every write this tab sends. The server keeps the newest per tab and refuses an
+// older one, so a hide flush racing an in-flight save can never let the older body win. Floored
+// at the clock so a reload of the same tab, which keeps its tab id, continues above its last write.
+let draftSeq = 0;
+// The {queue, review_state} body the server last confirmed, and the write that carried it. A
+// hidden page re-sends only when what it holds now differs, so switching apps does not cost a
+// request per switch.
+let draftConfirmedState = "";
+let draftConfirmedSeq = 0;
+// The highest write that failed after the last confirmed one. A still-older write succeeding says
+// nothing about whether the server holds the tab's newest notes, so only a confirmed write at
+// least this new may retire the failure banner.
+let draftFailedSeq = 0;
+
+function draftReviewState() {
+  return reviewStateHasText(lastReviewState) ? lastReviewState : null;
+}
+
+function reviewStateHasText(state) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) return false;
+  const hasCard = Boolean(state.card && String(state.card.text || "").trim());
+  const hasFields = Array.isArray(state.fields) && state.fields.length > 0;
+  return hasCard || hasFields;
+}
+
+function draftStateBody() {
+  return JSON.stringify({ queue: queued, review_state: draftReviewState() });
+}
+
+function sendDraftWrite() {
+  const state = draftStateBody();
+  const adopted = draftAdoptedTabs.slice();
+  draftSeq = Math.max(draftSeq + 1, Date.now());
+  const seq = draftSeq;
+  const body = JSON.stringify({ tab: draftTabId, seq, ...JSON.parse(state), ...(adopted.length ? { adopted } : {}) });
+  return fetch("/api/" + key + "/drafts", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body,
+    // A save started just before the tab closes must still land. Keepalive bodies share a
+    // small browser quota, counted in bytes, so an unusually large queue goes as an ordinary
+    // request.
+    keepalive: new TextEncoder().encode(body).length < DRAFT_KEEPALIVE_MAX_BYTES,
+  }).then(
+    (response) => {
+      if (seq < draftConfirmedSeq) return;
+      if (response?.ok) {
+        draftConfirmedSeq = seq;
+        draftConfirmedState = state;
+        draftAdoptedTabs = draftAdoptedTabs.filter((entry) => !adopted.includes(entry));
+        if (seq >= draftFailedSeq) showDraftSaveFailed(false);
+      } else {
+        draftFailedSeq = seq;
+        showDraftSaveFailed(true);
+      }
+    },
+    (error) => {
+      if (seq >= draftConfirmedSeq) {
+        draftFailedSeq = seq;
+        showDraftSaveFailed(true);
+      }
+      throw error;
+    },
+  );
+}
+
+// A save that did not land leaves the newest notes only in this tab's sessionStorage, which
+// closing the tab loses. Say so until a later save is confirmed; the next change retries.
+function showDraftSaveFailed(failed) {
+  if (draftSaveBanner) draftSaveBanner.hidden = !failed || ended;
+}
+
+// Mirror this tab's unsent notes to the server. Saves never overlap: a change made while one is
+// in flight is sent once it settles, so the server never ends on an older queue than the tab's.
+async function saveDraftsNow() {
+  if (!draftTabId || ended) return;
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = undefined;
+  if (draftSaveInFlight) {
+    draftSaveAgain = true;
+    return;
+  }
+  draftSaveInFlight = true;
+  try {
+    await sendDraftWrite();
+  } catch {
+    // The tab's own sessionStorage copy still holds the notes; the next change retries.
+  } finally {
+    draftSaveInFlight = false;
+    if (draftSaveAgain) {
+      draftSaveAgain = false;
+      saveDraftsNow();
+    }
+  }
+}
+
+function scheduleDraftSave() {
+  if (!draftTabId || ended) return;
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(() => {
+    draftSaveTimer = undefined;
+    saveDraftsNow();
+  }, DRAFT_SAVE_DEBOUNCE_MS);
+}
+
+// The page is being hidden or discarded (tab closed, app switched, in-app browser dismissed).
+// Send whatever the server does not have yet as a keepalive request, which outlives the page. It
+// may overlap a save still in flight; its higher sequence is what keeps it from being undone.
+function flushDraftsOnHide() {
+  if (!draftTabId || ended) return;
+  if (draftStateBody() === draftConfirmedState && draftTimerIdle()) return;
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = undefined;
+  try {
+    sendDraftWrite().catch(() => {});
+  } catch {
+    // Nothing else can be done for a page that is going away.
+  }
+}
+
+function draftTimerIdle() {
+  return draftSaveTimer === undefined && !draftSaveInFlight;
+}
+
+// Take over the unsent notes earlier tabs left on the server, so reopening a review link brings
+// them back. Notes keep their identity: one that another live tab also holds and sends is
+// settled here by the same transcript acknowledgement, never sent twice. A note this tab already
+// holds, by identity or by the artifact's replace-key, keeps this tab's version.
+function adoptStoredDrafts() {
+  if (sessionData.initialEnded) return 0;
+  // A terminal reservation restored from storage froze its batch before this page booted; a note
+  // adopted now would land outside that batch and be unsendable while the reservation holds. The
+  // record stays whole on the server for a load after the batch resolves.
+  if (terminalSubmission) return 0;
+  const present = new Set(queued.map(promptIdentity).filter(Boolean));
+  const queueKeys = new Set(
+    queued.map((prompt) => prompt?.[internalQueueKeyField]).filter((value) => typeof value === "string" && value),
+  );
+  let adopted = 0;
+  // This tab's own record goes first, so a card restored from it is settled before any other
+  // tab's card is considered, and another record's card is named taken only when it is kept.
+  const records = [
+    ...initialDrafts.filter((record) => String(record?.tab || "") === draftTabId),
+    ...initialDrafts.filter((record) => String(record?.tab || "") !== draftTabId),
+  ];
+  for (const record of records) {
+    const tab = String(record?.tab || "");
+    if (!isPromptIdentity(tab)) continue;
+    // This tab's own record on a reload. When the tab's last local write succeeded, the local
+    // queue and card state are newer than (or equal to) the server copy, and a note removed just
+    // before the reload must not come back from it. Otherwise the server copy may be the only
+    // current one, so it is merged like any other record (this tab's next write replaces it).
+    const own = tab === draftTabId;
+    if (own && localDraftSavedAtBoot) continue;
+    /** @type {any[]} */
+    const take = [];
+    for (const raw of Array.isArray(record.queue) ? record.queue : []) {
+      const prompt = adoptQueuedPrompt(raw, true);
+      const id = promptIdentity(prompt);
+      if (!prompt || !id || present.has(id) || chatAckIds.has(id)) continue;
+      const queueKey = typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField] : "";
+      if (queueKey && (queueKeys.has(queueKey) || take.some((other) => other[internalQueueKeyField] === queueKey))) {
+        continue;
+      }
+      take.push(prompt);
+    }
+    // Whole records only: one whose notes do not all fit stays untouched on the server for a
+    // later tab, so a note removed here can never come back from a partly copied record.
+    if (queued.length + take.length > draftMaxPrompts) continue;
+    for (const prompt of take) {
+      const queueKey = prompt[internalQueueKeyField];
+      if (typeof queueKey === "string" && queueKey) queueKeys.add(queueKey);
+      present.add(promptIdentity(prompt));
+      queued.push(prompt);
+      adopted += 1;
+    }
+    // The record's card text is taken only when this tab has no open card of its own, or when it
+    // is this tab's own newer copy. Card text it could not take stays on the server for a later tab.
+    const reviewState = record.review_state;
+    let tookReviewState = true;
+    if (reviewStateHasText(reviewState)) {
+      if (own || !reviewStateHasText(lastReviewState)) {
+        lastReviewState = reviewState;
+        noteLocalDraftWrite("reviewState", saveJsonState(reviewStateStorageKey, reviewState));
+      } else {
+        tookReviewState = JSON.stringify(lastReviewState) === JSON.stringify(reviewState);
+      }
+    }
+    if (!own) draftAdoptedTabs.push({ tab, seq: Number(record.seq) || 0, review_state: tookReviewState });
+  }
+  if (adopted) persistQueuedPrompts();
+  else if (draftAdoptedTabs.length) saveDraftsNow();
+  return adopted;
 }
 
 function persistTerminalReservation(reserved) {
@@ -794,10 +1086,10 @@ function replaceExpiredThumbnail(event) {
 chatLog.addEventListener("error", replaceExpiredThumbnail, true);
 
 const UNSENT_OWNERSHIP_COPY =
-  "Unsent answers stay in the tab or window where you entered them; taking over in another window does not bring them along.";
+  "Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.";
 const DEFAULT_SEND_HINT = "Nothing queued in this tab. " + UNSENT_OWNERSHIP_COPY;
 const EMPTY_SEND_HINT_HOLD_MS = 9000;
-const EMPTY_END_HINT = "Nothing to send. To end without feedback, use End session in the More menu (⋮).";
+const ACCEPT_REVIEW_PROMPT = "Review accepted. No comments.";
 
 function showSendHint(message = DEFAULT_SEND_HINT, holdMs = 2600, focusInput = true) {
   sendHint.textContent = message;
@@ -805,6 +1097,7 @@ function showSendHint(message = DEFAULT_SEND_HINT, holdMs = 2600, focusInput = t
   clearTimeout(sendHintTimer);
   sendHintPersistent = holdMs === null;
   sendHint.classList.toggle("persistent", sendHintPersistent);
+  renderSheetSummary();
   if (sendHintPersistent) {
     sendHintTimer = undefined;
     if (focusInput) chatInput.focus();
@@ -826,6 +1119,7 @@ function hideSendHint(force = false) {
   sendHint.classList.remove("persistent");
   sendHintPersistent = false;
   sendAcknowledgementWarningVisible = false;
+  renderSheetSummary();
 }
 
 function armSendAcknowledgementWarning() {
@@ -835,6 +1129,7 @@ function armSendAcknowledgementWarning() {
     if (pendingAcknowledgements.size > 0 && !sendFailureOwner) {
       sendAcknowledgementWarningVisible = true;
       showSendHint(SEND_STALLED_COPY, null, false);
+      renderSheetSummary();
     }
   }, SEND_ACKNOWLEDGEMENT_WARNING_MS);
 }
@@ -842,7 +1137,8 @@ function armSendAcknowledgementWarning() {
 function clearSendAcknowledgementWarning() {
   clearTimeout(sendAcknowledgementTimer);
   sendAcknowledgementTimer = undefined;
-  sendAcknowledgementWarningVisible = false;
+  // The stall hint goes with its flag, so the dock never reads it as a send failure in between.
+  if (sendAcknowledgementWarningVisible) hideSendHint(true);
 }
 
 function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
@@ -850,6 +1146,7 @@ function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
 }
 
 function showPersistentSendFailure(message, requireQueuedFeedback = false, owner = null) {
+  if (ended) return;
   clearSendAcknowledgementWarning();
   if (requireQueuedFeedback && !queued.length) return;
   if (sendFailureOwner?.kind === "preparation") return;
@@ -1134,6 +1431,7 @@ function syncChat(chat, revision) {
   for (const note of retiredDraftNodes) chatLog.appendChild(note);
   const anchor = retiredDraftNodes[retiredDraftNodes.length - 1] || workingBubble || lastChatBubble;
   if (anchor) scrollElementIntoView(anchor);
+  renderSheetSummary();
   return true;
 }
 
@@ -1163,6 +1461,8 @@ function setAgentPresence(state) {
 
 function setHandoffSuperseded(visible) {
   if (handoffBanner) handoffBanner.hidden = ended || !visible;
+  handoffSupersededVisible = !ended && Boolean(visible);
+  renderSheetSummary();
 }
 
 // The server this page was connected to went away. What is true beyond that depends on why, so
@@ -1187,21 +1487,26 @@ function setChromeOutdated(visible, reason = chromeOutdatedReason) {
   outdatedReloadInFlight = false;
   if (outdatedReloadButton) outdatedReloadButton.disabled = false;
   if (outdatedBanner) outdatedBanner.hidden = ended || !visible;
+  chromeOutdatedVisible = !ended && Boolean(visible);
+  renderSheetSummary();
 }
 
 function setReviewState(state) {
   lastReviewState = state;
   // The artifact reported a card, so its anchor exists: whatever miss was recorded is answered.
   if (state?.card) unrestorableDraftMiss = null;
+  scheduleDraftSave();
   if (!state || (!state.card && !(Array.isArray(state.fields) && state.fields.length))) {
     try {
       sessionStorage.removeItem(reviewStateStorageKey);
+      noteLocalDraftWrite("reviewState", true);
     } catch {
       // The in-memory state still works if browser storage is unavailable.
+      noteLocalDraftWrite("reviewState", false);
     }
     return;
   }
-  saveJsonState(reviewStateStorageKey, state);
+  noteLocalDraftWrite("reviewState", saveJsonState(reviewStateStorageKey, state));
 }
 
 function hasUnsentDraft() {
@@ -1287,12 +1592,197 @@ function scrollPanelToBottom() {
   panelScroll.scrollTop = panelScroll.scrollHeight;
 }
 
+// ---- Layout lock ----
+// chrome.css picks the phone layout by viewport width alone. A phone that reports a desktop-width
+// viewport - "Desktop site" / "Request Desktop Website", or an in-app browser that defaults to it -
+// got the side-by-side desktop layout shrunk onto a phone screen, with a conversation column too
+// small to read. So a touch phone gets the phone layout whatever width it reports, a link can ask
+// for one with `?layout=phone|desktop|auto`, and the More menu offers a toggle remembered on the
+// device. A forced layout rewrites the width conditions of chrome.css's own media rules, so the
+// stylesheet stays the one source of the layouts' geometry.
+const MOBILE_SHEET_MAX_PX = 860;
+const LAYOUT_STORAGE_KEY = "lavish-axi:layout";
+// A phone's short screen side is at most this many CSS px; tablets start well above it.
+const PHONE_SCREEN_MAX_PX = 600;
+// Below this ratio the browser is already close enough to the device width to need no zoom.
+const LAYOUT_ZOOM_MIN = 1.15;
+const LAYOUT_ZOOM_MAX = 4;
+const layoutToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById("layoutToggle"));
+const layoutToggleText = /** @type {HTMLSpanElement | null} */ (document.getElementById("layoutToggleText"));
+// The link's request wins for this page until the user picks a layout from the menu.
+let layoutOverride = readLayoutQuery();
+let layoutPreference = readLayoutPreference();
+/** @type {{ rule: any, original: string }[] | null} */
+let breakpointRules = null;
+let appliedLayout = "";
+let layoutZoom = 1;
+
+function readLayoutQuery() {
+  try {
+    const value = new URLSearchParams(String(location.search || "")).get("layout");
+    return value === "phone" || value === "desktop" || value === "auto" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+// Once the reviewer picks from the menu, a reload must not bring the link's layout back over it.
+function dropLayoutQuery() {
+  try {
+    const params = new URLSearchParams(String(location.search || ""));
+    if (!params.has("layout")) return;
+    params.delete("layout");
+    const search = params.toString();
+    window.history.replaceState(
+      window.history.state,
+      "",
+      location.pathname + (search ? "?" + search : "") + location.hash,
+    );
+  } catch {
+    // No history API: the choice still applies to this page.
+  }
+}
+
+function readLayoutPreference() {
+  try {
+    const value = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    return value === "phone" || value === "desktop" ? value : "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function mediaMatches(query) {
+  return typeof window.matchMedia === "function" && Boolean(window.matchMedia(query)?.matches);
+}
+
+// A touch-first device with a phone-sized screen. `screen` reports the device, not the layout
+// viewport, so this holds when the browser asks for a desktop page.
+function isTouchPhone() {
+  const screenInfo = window.screen;
+  const shortSide = Math.min(Number(screenInfo?.width) || 0, Number(screenInfo?.height) || 0);
+  return shortSide > 0 && shortSide <= PHONE_SCREEN_MAX_PX && mediaMatches("(pointer: coarse)");
+}
+
+function layoutMode() {
+  return layoutOverride || layoutPreference;
+}
+
+// "phone" or "desktop" when the layout is locked, "" when the viewport width decides.
+function resolvedLayout() {
+  const mode = layoutMode();
+  if (mode === "phone" || mode === "desktop") return mode;
+  return isTouchPhone() ? "phone" : "";
+}
+
+function chromeBreakpointRules() {
+  if (breakpointRules) return breakpointRules;
+  const found = [];
+  const visit = (rules) => {
+    for (const rule of Array.from(rules || [])) {
+      const media = /** @type {any} */ (rule).media;
+      if (media && typeof media.mediaText === "string" && /\(max-width:\s*\d+px\)/.test(media.mediaText)) {
+        found.push({ rule, original: media.mediaText });
+      }
+      if (/** @type {any} */ (rule).cssRules) visit(/** @type {any} */ (rule).cssRules);
+    }
+  };
+  for (const sheet of Array.from(document.styleSheets || [])) {
+    if (!/\/chrome\.css(?:[?#]|$)/.test(String(sheet.href || ""))) continue;
+    try {
+      visit(sheet.cssRules);
+    } catch {
+      // An unreadable sheet keeps its own media rules; the lock then only affects the JS layout.
+    }
+  }
+  breakpointRules = found;
+  return found;
+}
+
+// Each `(max-width: Npx)` becomes always-true or never-true for a locked layout. The phone lock keeps
+// the narrower refinements (640px, 320px) honest against the width the page is laid out at.
+function lockedMediaText(original, layout, width) {
+  return original.replace(/\(max-width:\s*(\d+)px\)/g, (_match, px) => {
+    const limit = Number(px);
+    const matches = layout === "phone" && (limit >= MOBILE_SHEET_MAX_PX || width <= limit);
+    return matches ? "(min-width: 0px)" : "(max-width: 0px)";
+  });
+}
+
+// A phone showing a desktop-width viewport scales the whole page down to fit; zoom the chrome back
+// up so the phone layout reads at phone size.
+function phoneLayoutZoom() {
+  const viewportWidth = Number(window.innerWidth) || 0;
+  if (viewportWidth <= MOBILE_SHEET_MAX_PX) return 1;
+  const screenInfo = window.screen;
+  const width = Number(screenInfo?.width) || 0;
+  const height = Number(screenInfo?.height) || 0;
+  // The device's orientation, never the viewport's shape: an on-screen keyboard shortens the
+  // viewport of an upright phone without turning it.
+  const orientation = String(screenInfo?.orientation?.type || "");
+  const landscape = orientation ? orientation.startsWith("landscape") : width > height;
+  const deviceWidth = landscape ? Math.max(width, height) : Math.min(width, height);
+  if (!(deviceWidth > 0)) return 1;
+  const zoom = viewportWidth / deviceWidth;
+  return zoom >= LAYOUT_ZOOM_MIN ? Math.round(Math.min(zoom, LAYOUT_ZOOM_MAX) * 1000) / 1000 : 1;
+}
+
+function applyLayoutLock() {
+  const layout = resolvedLayout();
+  // Only a phone needs the zoom: a desktop that asks for the phone layout lays it out at its own size.
+  const zoom = layout === "phone" && isTouchPhone() ? phoneLayoutZoom() : 1;
+  const root = document.documentElement;
+  const zoomChanged = zoom !== layoutZoom;
+  if (root?.style && zoomChanged) root.style.zoom = zoom === 1 ? "" : String(zoom);
+  layoutZoom = zoom;
+  if (zoomChanged) syncVisualViewport();
+  if (root?.style && typeof root.style.setProperty === "function") {
+    if (zoom === 1) root.style.removeProperty("--layout-vh");
+    else root.style.setProperty("--layout-vh", (Number(window.innerHeight) || 0) / zoom + "px");
+  }
+  const width = (Number(window.innerWidth) || 0) / zoom;
+  for (const { rule, original } of chromeBreakpointRules()) {
+    const next = layout ? lockedMediaText(original, layout, width) : original;
+    if (rule.media.mediaText !== next) rule.media.mediaText = next;
+  }
+  appliedLayout = layout;
+  renderLayoutToggle();
+}
+
+function renderLayoutToggle() {
+  if (!layoutToggleText) return;
+  const mode = layoutMode();
+  if (mode === "phone") layoutToggleText.textContent = "Layout: Phone";
+  else if (mode === "desktop") layoutToggleText.textContent = "Layout: Desktop";
+  else layoutToggleText.textContent = appliedLayout === "phone" ? "Layout: Auto (phone)" : "Layout: Auto";
+}
+
+// Auto, then Phone, then Desktop. The choice is the viewer's, so it is kept per device for every
+// review, like the desktop panel collapse.
+function cycleLayoutPreference() {
+  const order = ["auto", "phone", "desktop"];
+  const next = order[(order.indexOf(layoutMode()) + 1) % order.length];
+  layoutOverride = "";
+  dropLayoutQuery();
+  layoutPreference = next;
+  try {
+    if (next === "auto") localStorage.removeItem(LAYOUT_STORAGE_KEY);
+    else localStorage.setItem(LAYOUT_STORAGE_KEY, next);
+  } catch {
+    // Storage refused: the choice still applies to this page.
+  }
+  applyLayoutLock();
+  onLayoutChange();
+}
+
+applyLayoutLock();
+
 // ---- Phone-width conversation sheet ----
 // Below this width chrome.css turns the conversation panel into a dock the user raises as a
 // bottom sheet over the artifact. This controller owns intent, accessibility state, gestures,
 // visual-viewport measurements, and the dock summary; CSS owns the geometry. The query must match
 // the one chrome.css lays the sheet out under.
-const MOBILE_SHEET_MEDIA = "(max-width: 860px)";
+const MOBILE_SHEET_MEDIA = "(max-width: " + MOBILE_SHEET_MAX_PX + "px)";
 // How far a drag on the dock must travel before it counts as a gesture rather than a tap.
 const SHEET_DRAG_THRESHOLD_PX = 48;
 const sheetStorageKey = "lavish-axi:sheet-open:" + key;
@@ -1316,6 +1806,7 @@ function readSheetOpen() {
 }
 
 function isMobileSheet() {
+  if (appliedLayout) return appliedLayout === "phone";
   return Boolean(sheetMedia && sheetMedia.matches);
 }
 
@@ -1354,26 +1845,81 @@ function applySheetState() {
   renderSheetSummary();
 }
 
-// What the closed dock says. One line, most actionable state first: work the user has queued,
-// then a reply they have not seen, then whether the agent is there to receive a send.
-function sheetSummary() {
-  if (ended) return { text: "Session ended", accent: false, unread: false };
-  if (queued.length > 0) {
-    return { text: queued.length === 1 ? "1 queued" : queued.length + " queued", accent: true, unread: false };
+// Trouble the reviewer has to act on, in priority order. Each one is also shown in full inside the
+// panel; this is the one-line version for when the panel is closed.
+function dockAlert() {
+  if (ended) return null;
+  const serverReplaced = chromeOutdatedReason === "upgrade" || chromeOutdatedReason === "local-build";
+  const outdatedVisible = chromeOutdatedVisible;
+  if ((outdatedVisible && !serverReplaced) || liveEventFailures >= LIVE_EVENT_UNREACHABLE_FAILURES) {
+    return { text: chromeOutdatedReason === "stop" ? "Lavish stopped" : "Lavish unreachable", level: "error" };
   }
-  if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true };
-  if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false };
-  if (agentPresence === "external") return { text: "External listener active", accent: false, unread: false };
-  if (agentPresence === "listening") return { text: "Agent listening", accent: false, unread: false };
-  return { text: "Agent not listening", accent: false, unread: false };
+  if (sendHintPersistent && !sendAcknowledgementWarningVisible) return { text: "Could not send", level: "error" };
+  if (sendAcknowledgementWarningVisible) return { text: "Still sending…", level: "warn" };
+  if (outdatedVisible) {
+    return {
+      text: chromeOutdatedReason === "upgrade" ? "Lavish updated · reload" : "Lavish restarted · reload",
+      level: "warn",
+    };
+  }
+  if (handoffSupersededVisible) return { text: "Open in another tab", level: "warn" };
+  if (agentPresence === "waiting" && hasUnseenSentNotes()) return { text: "No agent listening", level: "warn" };
+  return null;
+}
+
+// A sent note no agent has picked up yet, while nothing is listening: the panel says so on each
+// bubble, and the closed dock must not read as if all is well.
+function hasUnseenSentNotes() {
+  return displayedChat.some((entry) => entry?.role === "user" && hasReceipt(entry) && !entry.delivered_at);
+}
+
+// What the closed dock says. One line, most actionable state first: trouble, then work the user
+// has queued, then a reply they have not seen, then whether the agent is there to receive a send.
+function sheetSummary() {
+  if (ended) return { text: "Session ended", accent: false, unread: false, alert: "" };
+  const alert = dockAlert();
+  if (alert) {
+    const count = queued.length;
+    const suffix = count === 0 ? "" : count === 1 ? " · 1 queued" : " · " + count + " queued";
+    return {
+      text: alert.text + suffix,
+      accent: false,
+      unread: false,
+      alert: alert.level,
+      alertKey: alert.level + ":" + alert.text,
+    };
+  }
+  if (queued.length > 0) {
+    return {
+      text: queued.length === 1 ? "1 queued" : queued.length + " queued",
+      accent: true,
+      unread: false,
+      alert: "",
+    };
+  }
+  if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true, alert: "" };
+  if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false, alert: "" };
+  if (agentPresence === "external") {
+    return { text: "External listener active", accent: false, unread: false, alert: "" };
+  }
+  if (agentPresence === "listening") return { text: "Agent listening", accent: false, unread: false, alert: "" };
+  return { text: "Agent not listening", accent: false, unread: false, alert: "" };
 }
 
 function renderSheetSummary() {
+  if (!dockSummaryReady) return;
   const summary = sheetSummary();
   panelSummary.textContent = summary.text;
   panelSummary.classList.toggle("is-accent", summary.accent);
   panelSummary.classList.toggle("is-unread", summary.unread);
-  renderSidebarToggle();
+  panelSummary.classList.toggle("is-alert", summary.alert === "error");
+  panelSummary.classList.toggle("is-warn", summary.alert === "warn");
+  panelHead.classList.toggle("has-alert", summary.alert === "error");
+  // A newly raised failure pulses the closed dock once, like a reply does.
+  const alertKey = summary.alert === "error" ? summary.alertKey : "";
+  if (alertKey && alertKey !== lastDockAlertKey) pulseSheetDock();
+  lastDockAlertKey = alertKey;
+  renderSidebarToggle(summary);
 }
 
 // A brief pulse on the dock when something the user should notice lands while the sheet is
@@ -1401,11 +1947,12 @@ function syncVisualViewport() {
   const root = document.documentElement;
   if (!root || !root.style || typeof root.style.setProperty !== "function") return;
   const viewport = window.visualViewport;
-  const height = viewport ? viewport.height : window.innerHeight;
-  const top = viewport ? viewport.offsetTop : 0;
+  // The visual viewport is measured outside the layout zoom, and these lengths are used inside it.
+  const height = Math.round(viewport ? viewport.height : window.innerHeight) / layoutZoom;
+  const top = Math.round(Math.max(0, (viewport ? viewport.offsetTop : 0) || 0)) / layoutZoom;
   if (!(height > 0)) return;
-  root.style.setProperty("--vv-height", Math.round(height) + "px");
-  root.style.setProperty("--vv-top", Math.round(Math.max(0, top || 0)) + "px");
+  root.style.setProperty("--vv-height", height + "px");
+  root.style.setProperty("--vv-top", top + "px");
 }
 
 function sheetDragOffset(event) {
@@ -1461,21 +2008,33 @@ panelHead.addEventListener("pointercancel", (event) => {
   clearSheetDrag();
   suppressSheetClick = false;
 });
-if (sheetMedia && typeof sheetMedia.addEventListener === "function") {
-  sheetMedia.addEventListener("change", (event) => {
-    if (!event.matches) {
-      sheetOpen = false;
-      try {
-        sessionStorage.removeItem(sheetStorageKey);
-      } catch {
-        // Storage refusal only prevents persistence; the in-memory state is already reset.
-      }
+// The phone layout was entered or left, by a viewport crossing the breakpoint or by the layout lock.
+function onLayoutChange() {
+  if (!isMobileSheet()) {
+    sheetOpen = false;
+    try {
+      sessionStorage.removeItem(sheetStorageKey);
+    } catch {
+      // Storage refusal only prevents persistence; the in-memory state is already reset.
     }
-    // A reply previewed while one layout hid the conversation is no longer owed once the other
-    // layout shows it.
-    if (!isConversationHidden()) unreadAgentReply = "";
-    applySheetState();
-    applyPanelCollapsed();
+  }
+  // A reply previewed while one layout hid the conversation is no longer owed once the other
+  // layout shows it.
+  if (!isConversationHidden()) unreadAgentReply = "";
+  applySheetState();
+  applyPanelCollapsed();
+}
+
+if (layoutToggle) layoutToggle.onclick = () => cycleLayoutPreference();
+// An orientation change moves a zoomed phone layout to a different device width.
+window.addEventListener("resize", () => {
+  if (appliedLayout) applyLayoutLock();
+});
+
+if (sheetMedia && typeof sheetMedia.addEventListener === "function") {
+  sheetMedia.addEventListener("change", () => {
+    // A locked layout ignores the viewport width.
+    if (!appliedLayout) onLayoutChange();
   });
 }
 if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
@@ -1537,15 +2096,18 @@ function applyPanelCollapsed() {
 
 // While collapsed the toggle stands in for the panel: it counts queued notes (the thing still to
 // send) or, failing that, marks an agent reply that arrived out of sight.
-function renderSidebarToggle() {
+function renderSidebarToggle(summary = dockSummaryReady ? sheetSummary() : null) {
   const collapsed = panelCollapsed && !isMobileSheet();
   const count = collapsed ? queued.length : 0;
   const unread = collapsed && count === 0 && Boolean(unreadAgentReply);
+  const alert = collapsed && summary?.alert === "error";
   sidebarToggleCount.textContent = count > 0 ? String(count) : "";
   sidebarToggleCount.hidden = count === 0;
-  sidebarToggle.classList.toggle("is-unread", unread);
+  sidebarToggle.classList.toggle("is-unread", unread && !alert);
+  sidebarToggle.classList.toggle("is-alert", alert);
   let label = collapsed ? "Show conversation" : "Hide conversation";
-  if (count > 0) label += count === 1 ? " (1 queued)" : " (" + count + " queued)";
+  if (alert) label += " (" + summary.text + ")";
+  else if (count > 0) label += count === 1 ? " (1 queued)" : " (" + count + " queued)";
   else if (unread) label += " (new reply)";
   sidebarToggle.setAttribute("aria-label", label);
   sidebarToggle.title = label;
@@ -1653,11 +2215,11 @@ function queuedAnchorSelectorsOf(prompt) {
 }
 
 // Tells the artifact which element selectors carry a queued note. Only selectors cross into the
-// frame: the artifact is agent-authored, and the note text stays in the chrome.
+// frame: the artifact is agent-authored, and the note text stays in the chrome. Each selector is
+// listed where its newest note sits, oldest first, so the artifact can prefer an element's newest note.
 function postQueuedAnchors(force = false) {
-  const selectors = [
-    ...new Set(queued.filter((prompt) => isElementAnchoredPrompt(prompt)).flatMap(queuedAnchorSelectorsOf)),
-  ];
+  const anchored = queued.filter((prompt) => isElementAnchoredPrompt(prompt)).flatMap(queuedAnchorSelectorsOf);
+  const selectors = [...new Set(anchored.reverse())].reverse();
   const signature = JSON.stringify(selectors);
   if (!force && signature === postedQueuedAnchors) return;
   postedQueuedAnchors = signature;
@@ -1766,6 +2328,7 @@ function stripInternalPromptFields(prompt) {
   if (!prompt || typeof prompt !== "object") return prompt;
   const clean = { ...prompt };
   delete clean[internalQueueKeyField];
+  delete clean[acceptancePromptField];
   return clean;
 }
 
@@ -2043,26 +2606,21 @@ function sendQueued(endAfter) {
     const text = chatInput.value.trim();
     const attachments = chatAttachmentController.collectReady();
     if (text || attachments.length) {
-      const prompt = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+      const prompt = freeformPrompt(text);
       if (attachments.length) prompt.attachments = attachments;
-      assignPromptIdentity(prompt, false);
-      queued.push(prompt);
-      persistQueuedPrompts();
       // Render the durable queued bubble before clearing the editor. If anything after this point
       // fails, the user's words are already both stored and visibly recoverable in the tab. It
       // becomes a sent bubble only when the server's transcript carries it (see submitQueuedOnce).
-      render();
+      pushQueuedPrompt(prompt);
       chatInput.value = "";
       chatAttachmentController.reset();
     }
   }
   const shouldEnd = Boolean(endAfter && !chipsBlocked);
   const preparations = shouldEnd ? [...feedbackPreparations] : [];
-  if (!queued.length && preparations.length === 0) {
-    if (!chipsBlocked && !sendFailureOwner) {
-      if (endAfter) showSendHint(EMPTY_END_HINT);
-      else showSendHint(DEFAULT_SEND_HINT, EMPTY_SEND_HINT_HOLD_MS);
-    }
+  const acceptsEmptyReview = shouldEnd && sendFailureOwner?.kind !== "preparation";
+  if (!queued.length && preparations.length === 0 && !acceptsEmptyReview) {
+    if (!chipsBlocked && !sendFailureOwner) showSendHint(DEFAULT_SEND_HINT, EMPTY_SEND_HINT_HOLD_MS);
     return;
   }
   if (!sendFailureOwner) hideSendHint(true);
@@ -2079,6 +2637,21 @@ function sendQueued(endAfter) {
   }
   requestSnapshot("submit", queued.slice(), false, null);
   render();
+}
+
+function freeformPrompt(text) {
+  return { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+}
+
+function pushQueuedPrompt(prompt) {
+  assignPromptIdentity(prompt, false);
+  queued.push(prompt);
+  persistQueuedPrompts();
+  render();
+}
+
+function queueAcceptancePrompt() {
+  pushQueuedPrompt({ ...freeformPrompt(ACCEPT_REVIEW_PROMPT), [acceptancePromptField]: true });
 }
 
 function finishTerminalPreparation(terminal, preparations) {
@@ -2108,13 +2681,9 @@ function completeTerminalPreparation(terminal, results) {
     releaseTerminalSubmission(terminal);
     return;
   }
-  terminal.prompts = queued.slice();
   clearPreparationFailure("terminal");
-  if (!terminal.prompts.length) {
-    releaseTerminalSubmission(terminal);
-    if (!sendFailureOwner) showSendHint(EMPTY_END_HINT);
-    return;
-  }
+  if (!queued.length) queueAcceptancePrompt();
+  terminal.prompts = queued.slice();
   // Only make the reservation durable once every preparation has joined the exact
   // batch. A reload before this point must restore an ordinary editable queue, not
   // an incomplete terminal submission.
@@ -2140,8 +2709,26 @@ function markTerminalSubmissionFailed(submission) {
 function releaseTerminalSubmission(terminal) {
   if (terminalSubmission !== terminal || ended) return;
   terminalSubmission = null;
+  // A rejected terminal batch never reached the agent, so its synthesized acceptance must not
+  // ride along with the reviewer's next message.
+  for (let index = queued.length - 1; index >= 0; index -= 1) {
+    if (queued[index][acceptancePromptField]) queued.splice(index, 1);
+  }
+  afterQueuedPromptRemoved();
   persistTerminalReservation(false);
   render();
+}
+
+function reportRejectedSend(submission, message) {
+  if (!submission.terminal) {
+    showQueuedSendFailure(message, { kind: "submission", operation: submission });
+    return;
+  }
+  const acceptanceOnly = queued.every((prompt) => prompt[acceptancePromptField]);
+  releaseTerminalSubmission(submission.terminal);
+  if (ended) return;
+  if (acceptanceOnly) showSendHint(EMPTY_END_FAILED_COPY, null, false);
+  else showQueuedSendFailure(message, { kind: "submission", operation: submission });
 }
 
 async function submitQueued(submission) {
@@ -2231,11 +2818,10 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   }
   if (!response.ok) {
     if (response.status === 413) {
-      showQueuedSendFailure(
+      reportRejectedSend(
+        submission,
         "Could not send because this feedback is too large. It is still queued. Remove some feedback or attachments, then try again.",
-        { kind: "submission", operation: submission },
       );
-      if (submission.terminal) releaseTerminalSubmission(submission.terminal);
       throw new Error("queued feedback exceeds the request size limit");
     }
     if (response.status === 409) {
@@ -2249,11 +2835,10 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
         return false;
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
-      showQueuedSendFailure(
+      reportRejectedSend(
+        submission,
         "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
-        { kind: "submission", operation: submission },
       );
-      if (submission.terminal) releaseTerminalSubmission(submission.terminal);
       return;
     }
     // C4: the server persisted nothing (atomic reject) - the queue below is left
@@ -2262,11 +2847,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
     if (response.status === 400) {
       const detail = await response.json().catch(() => ({}));
       if (Array.isArray(detail.rejected) && detail.rejected.length) {
-        showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps), {
-          kind: "submission",
-          operation: submission,
-        });
-        if (submission.terminal) releaseTerminalSubmission(submission.terminal);
+        reportRejectedSend(submission, describeAttachmentRejection(detail.rejected, detail.caps));
       } else {
         showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
           kind: submission.terminal ? "terminal" : "submission",
@@ -3179,6 +3760,7 @@ function markSessionEnded() {
   if (presenceBanner) presenceBanner.hidden = true;
   if (handoffBanner) handoffBanner.hidden = true;
   if (outdatedBanner) outdatedBanner.hidden = true;
+  if (draftSaveBanner) draftSaveBanner.hidden = true;
   layoutGateManuallyBypassed = true;
   layoutGateFailureSticky = false;
   revealLayoutGate();
@@ -3484,7 +4066,7 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
     resetRevisionLegend();
     startLayoutGateCycle();
     const currentSrc = frame.src || "about:blank";
-    frame.src = currentSrc + (currentSrc.includes("?") ? "&" : "?") + "lavish_reload=" + Date.now();
+    navigateArtifactFrame(currentSrc + (currentSrc.includes("?") ? "&" : "?") + "lavish_reload=" + Date.now());
     return true;
   }
   const requestSequence = ++artifactLoadRequestSequence;
@@ -3605,7 +4187,7 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   // The next document reports its own registry once it loads; until then the
   // previous revision's legend would point at blocks that may no longer exist.
   resetRevisionLegend();
-  frame.src = artifactFrameSrcForLoad({ revision, token });
+  navigateArtifactFrame(artifactFrameSrcForLoad({ revision, token }));
   return true;
 }
 
@@ -4767,7 +5349,9 @@ function connectLiveEvents() {
   const socket = new WebSocket(protocol + "//" + location.host + "/events/" + encodeURIComponent(key));
   socket.addEventListener("open", () => {
     eventReconnectDelayMs = 500;
+    const wasUnreachable = liveEventFailures >= LIVE_EVENT_UNREACHABLE_FAILURES;
     liveEventFailures = 0;
+    if (wasUnreachable) renderSheetSummary();
     unreachableDismissed = false;
     if (unreachableBannerOwned) {
       unreachableBannerOwned = false;
@@ -4786,6 +5370,7 @@ function connectLiveEvents() {
   socket.addEventListener("close", () => {
     liveEventFailures += 1;
     noteLiveEventsUnreachable();
+    if (liveEventFailures === LIVE_EVENT_UNREACHABLE_FAILURES) renderSheetSummary();
     setTimeout(connectLiveEvents, eventReconnectDelayMs);
     eventReconnectDelayMs = Math.min(eventReconnectDelayMs * 2, 5000);
   });
@@ -4829,10 +5414,27 @@ events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
 connectLiveEvents();
 
+draftTabId = loadDraftTabId();
+const restoredDraftCount = adoptStoredDrafts();
+window.addEventListener("pagehide", flushDraftsOnHide);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushDraftsOnHide();
+});
+
+dockSummaryReady = true;
 applySheetState();
 applyPanelCollapsed();
 settleQueuedFromTranscript(initialChat, false);
 render();
+if (restoredDraftCount) {
+  showSendHint(
+    restoredDraftCount === 1
+      ? "Restored 1 unsent note saved with this review."
+      : "Restored " + restoredDraftCount + " unsent notes saved with this review.",
+    6000,
+    false,
+  );
+}
 setChromeOutdated(false);
 setWarningsDrawerOpen(false);
 renderWarnings();

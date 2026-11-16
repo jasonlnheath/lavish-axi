@@ -562,6 +562,17 @@ body.lavish {
   background: var(--accent);
   box-shadow: 0 0 0 2px var(--bg-bar);
 }
+.sidebar-toggle.is-alert::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--danger);
+  box-shadow: 0 0 0 2px var(--bg-bar);
+}
 .menu {
   position: absolute;
   background: var(--bg-bar);
@@ -1205,6 +1216,7 @@ body.lavish {
 .bubble.note .note-draft {
   margin-top: 6px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   user-select: text;
 }
 .bubble.note .note-warning {
@@ -1240,6 +1252,8 @@ body.lavish {
 }
 .bubble-text {
   white-space: pre-wrap;
+  /* The panel hides horizontal overflow, so a long URL or path must wrap or its tail is lost. */
+  overflow-wrap: anywhere;
 }
 /* Consecutive items from one send sit closer, so a batch reads as a group. */
 .bubble.user + .bubble.user {
@@ -1306,6 +1320,15 @@ body.lavish {
   padding: 8px;
   font: inherit;
   box-sizing: border-box;
+}
+/* Where supported, the editor grows with the note up to a cap, so a long note is not half hidden
+   while it is revised. Elsewhere it keeps the fixed minimum and the free vertical resize. */
+@supports (field-sizing: content) {
+  .queued-edit-input {
+    field-sizing: content;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
 }
 .queued-edit-actions {
   display: flex;
@@ -1439,8 +1462,8 @@ body.lavish {
   font-variant-numeric: tabular-nums;
 }
 /* Agent prose: the Markdown subset src/chat-messages.js renders, sized for a 360px column. */
-.chat-md > :first-child {
-  margin-top: 0;
+.chat-md {
+  overflow-wrap: anywhere;
 }
 .chat-md > :last-child {
   margin-bottom: 0;
@@ -1452,6 +1475,11 @@ body.lavish {
   margin: 12px 0 4px;
   font-weight: var(--w-semi);
   color: var(--fg);
+}
+/* After the heading rule: same specificity, so source order lets a reply that opens with a
+   heading sit flush like any other block. */
+.chat-md > :first-child {
+  margin-top: 0;
 }
 .chat-md ul,
 .chat-md ol {
@@ -1486,8 +1514,22 @@ body.lavish {
   border-radius: var(--radius-sm);
   padding: 0 5px;
   color: var(--cream-200);
+  /* A short span moves to the next line whole; one wider than the whole line wraps inside its chip.
+     The negative margin keeps the chip's border out of the line height, as an inline chip's is. */
+  display: inline-block;
+  max-width: 100%;
+  margin-block: -1px;
+}
+/* A span too long to keep on one line (src/chat-messages.js marks it) wraps, and every fragment
+   keeps its own border and padding instead of an open-ended chip. */
+.chat-md code.chat-code-long {
+  display: inline;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
 }
 .chat-md pre code {
+  display: inline;
   background: none;
   border: 0;
   padding: 0;
@@ -1545,7 +1587,7 @@ body.lavish {
   color: var(--accent);
   cursor: pointer;
   font: inherit;
-  font-weight: var(--w-semibold);
+  font-weight: var(--w-semi);
   padding: 0;
   white-space: nowrap;
 }
@@ -1744,7 +1786,7 @@ body.layout-gate-active iframe#artifact {
     right: 10px;
     left: 10px;
     width: auto;
-    max-height: min(70vh, 460px);
+    max-height: min(calc(var(--layout-vh, 100vh) * 0.7), 460px);
   }
 }
 /* Phone-width chrome: the artifact takes the whole viewport above a persistent conversation dock,
@@ -1770,7 +1812,7 @@ body.layout-gate-active iframe#artifact {
   }
   .layout {
     height: calc(100vh - var(--bar-h));
-    height: calc(100dvh - var(--bar-h));
+    height: calc(var(--layout-vh, 100dvh) - var(--bar-h));
     grid-template-columns: minmax(0, 1fr);
     /* The second row only reserves the dock's footprint so the artifact is never underneath it;
        the panel itself is fixed. */
@@ -1865,6 +1907,29 @@ body.layout-gate-active iframe#artifact {
     color: var(--accent);
     font-weight: var(--w-semi);
   }
+  /* Trouble the closed sheet would otherwise hide: a failed send, a stopped server. */
+  .panel-summary.is-alert {
+    color: var(--danger);
+    font-weight: var(--w-semi);
+  }
+  .panel-summary.is-warn {
+    color: var(--accent);
+    font-weight: var(--w-semi);
+  }
+  .panel-summary.is-alert::before,
+  .panel-summary.is-warn::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 6px;
+    border-radius: var(--radius-pill);
+    background: currentColor;
+    vertical-align: 1px;
+  }
+  body:not(.sheet-open) .panel-head.has-alert {
+    box-shadow: inset 0 2px 0 var(--danger);
+  }
   .panel-summary.is-unread::before {
     content: "";
     display: inline-block;
@@ -1923,7 +1988,7 @@ body.layout-gate-active iframe#artifact {
     padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   }
   .chat-attachments {
-    max-height: min(176px, 25dvh);
+    max-height: min(176px, calc(var(--layout-vh, 100dvh) * 0.25));
   }
   .composer .actions {
     position: sticky;

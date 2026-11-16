@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { AxiError } from "axi-sdk-js";
+import { canonicalFile } from "../src/session-store.js";
 
 process.env.LAVISH_AXI_HOST = "127.0.0.1";
 process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
@@ -263,7 +264,9 @@ test("lavish-axi server --feedback-cmd pushes the accepted batch, and the secret
     assert.equal(queued.status, 200);
 
     const [entry] = await waitForHookRecords(record);
-    assert.equal(entry.payload.session.file, artifact);
+    // The server canonicalizes the artifact path with `realpath` (macOS `/var` → `/private/var`,
+    // Windows 8.3 short names), so the hook payload carries the canonical spelling.
+    assert.equal(entry.payload.session.file, await canonicalFile(artifact));
     assert.deepEqual(
       entry.payload.prompts.map((prompt) => prompt.prompt),
       ["widen the totals column"],
@@ -323,7 +326,8 @@ test("a server Lavish starts for an agent picks the hook up from its environment
     assert.equal(queued.status, 200);
 
     const [entry] = await waitForHookRecords(record);
-    assert.equal(entry.payload.session.file, artifact);
+    // Same canonicalization as above: compare the hook payload against the canonical path.
+    assert.equal(entry.payload.session.file, await canonicalFile(artifact));
     assert.deepEqual(
       entry.payload.prompts.map((prompt) => prompt.prompt),
       ["the environment-configured hook should see this"],
