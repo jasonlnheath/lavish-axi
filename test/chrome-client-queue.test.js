@@ -347,18 +347,30 @@ async function createChromeHarness({
   element("lavish-session").textContent = JSON.stringify(sessionData);
   const frame = element("artifact");
   frame.dataset.artifactSrc = artifactSrc;
+  // Like a real iframe, `src` reports the attribute, while `location.replace` navigates the frame
+  // without changing it. `documentSrc` is the URL of the document the frame currently holds.
+  let documentSrc = "";
+  function navigateFrame(src, via) {
+    documentSrc = src;
+    srcLoads.push({ src, via, hadMessageListener: windowListeners.has("message") });
+  }
   Object.defineProperty(frame, "src", {
     get() {
       return this.currentSrc || "";
     },
     set(value) {
       this.currentSrc = String(value);
-      srcLoads.push({ src: this.currentSrc, hadMessageListener: windowListeners.has("message") });
+      navigateFrame(this.currentSrc, "src");
     },
   });
   frame.contentWindow = {
     postMessage(message) {
       postedToFrame.push(message);
+    },
+    location: {
+      replace(url) {
+        navigateFrame(String(url), "replace");
+      },
     },
   };
   // The served chrome nests these inside the composer, and drag handling reads
@@ -613,7 +625,7 @@ async function createChromeHarness({
   if (artifactSrc) frame.dispatch("load");
 
   function frameLoadToken() {
-    const match = String(frame.src).match(/[?&]artifact_load_token=([^&]+)/);
+    const match = documentSrc.match(/[?&]artifact_load_token=([^&]+)/);
     return match ? decodeURIComponent(match[1]) : "";
   }
 
@@ -752,6 +764,7 @@ async function createChromeHarness({
       clockNow += ms;
     },
     srcLoads,
+    artifactDocumentSrc: () => documentSrc,
     beginRequests,
     artifactBeginRequests,
     draftRequests,
@@ -4074,6 +4087,28 @@ test("chrome client registers message listener before loading the artifact ifram
   assert.equal(chrome.srcLoads[0].hadMessageListener, true);
 });
 
+// Assigning `src` to a loaded iframe adds a tab history entry, so live reloads used to grow
+// `history.length` until Chromium refused `window.close()` on the review tab (#426).
+test("live reloads replace the artifact frame's location instead of reassigning src", async () => {
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html" });
+  await flushPromises();
+  const firstSrc = chrome.frame.src;
+
+  for (let i = 0; i < 3; i += 1) {
+    chrome.eventSource().listeners.get("reload")();
+    await flushPromises();
+    await flushPromises();
+  }
+
+  assert.deepEqual(
+    chrome.srcLoads.map((load) => load.via),
+    ["src", "replace", "replace", "replace"],
+  );
+  assert.equal(chrome.frame.src, firstSrc);
+  assert.match(chrome.artifactDocumentSrc(), /artifact_load_token=harness-load-4$/);
+  assert.equal(chrome.artifactLoadToken(), "harness-load-4");
+});
+
 // The embedded load token in a freshly served chrome page may already be retired: the previous tab's
 // begin-load is what issued it. Navigating to it first commits the 409 "no longer current" page, and
 // Chrome can then drop the begin-load's navigation, leaving the review stuck on that page (#451).
@@ -4244,18 +4279,18 @@ test("a failed begin-load keeps the previous frame until a retry succeeds", asyn
     },
   });
 
-  const previousSrc = chrome.frame.src;
+  const previousSrc = chrome.artifactDocumentSrc();
   beginLoadResponses.push(
     { ok: false, status: 503 },
     { ok: true, json: async () => ({ artifact_revision: 2, artifact_load_token: "retry-load" }) },
   );
   chrome.eventSource().listeners.get("reload")();
   await flushPromises();
-  assert.equal(chrome.frame.src, previousSrc);
+  assert.equal(chrome.artifactDocumentSrc(), previousSrc);
 
   chrome.runTimers(100);
   await flushPromises();
-  assert.match(chrome.frame.src, /artifact_load_token=retry-load/);
+  assert.match(chrome.artifactDocumentSrc(), /artifact_load_token=retry-load/);
   assert.equal(
     posts.some((post) => post.url === "/api/abc/artifact-failures"),
     false,
@@ -4274,7 +4309,7 @@ test("exhausted begin-load retries preserve the previous frame without waking th
     },
   });
 
-  const previousSrc = chrome.frame.src;
+  const previousSrc = chrome.artifactDocumentSrc();
   const previousToken = chrome.artifactLoadToken();
   beginLoadResponses.push({ ok: false, status: 503 }, { ok: false, status: 503 }, { ok: false, status: 503 });
   chrome.eventSource().listeners.get("reload")();
@@ -4284,7 +4319,7 @@ test("exhausted begin-load retries preserve the previous frame without waking th
   chrome.runTimers(300);
   await flushPromises();
 
-  assert.equal(chrome.frame.src, previousSrc);
+  assert.equal(chrome.artifactDocumentSrc(), previousSrc);
   assert.equal(chrome.artifactLoadToken(), previousToken);
   assert.equal(
     posts.some((post) => post.url === "/api/abc/artifact-failures"),
