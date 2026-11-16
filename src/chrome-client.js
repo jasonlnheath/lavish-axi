@@ -592,6 +592,10 @@ let draftSeq = 0;
 // request per switch.
 let draftConfirmedState = "";
 let draftConfirmedSeq = 0;
+// The highest write that failed after the last confirmed one. A still-older write succeeding says
+// nothing about whether the server holds the tab's newest notes, so only a confirmed write at
+// least this new may retire the failure banner.
+let draftFailedSeq = 0;
 
 function draftReviewState() {
   return reviewStateHasText(lastReviewState) ? lastReviewState : null;
@@ -625,14 +629,21 @@ function sendDraftWrite() {
   }).then(
     (response) => {
       if (seq < draftConfirmedSeq) return;
-      showDraftSaveFailed(!response?.ok);
-      if (!response?.ok) return;
-      draftConfirmedSeq = seq;
-      draftConfirmedState = state;
-      draftAdoptedTabs = draftAdoptedTabs.filter((entry) => !adopted.includes(entry));
+      if (response?.ok) {
+        draftConfirmedSeq = seq;
+        draftConfirmedState = state;
+        draftAdoptedTabs = draftAdoptedTabs.filter((entry) => !adopted.includes(entry));
+        if (seq >= draftFailedSeq) showDraftSaveFailed(false);
+      } else {
+        draftFailedSeq = seq;
+        showDraftSaveFailed(true);
+      }
     },
     (error) => {
-      if (seq >= draftConfirmedSeq) showDraftSaveFailed(true);
+      if (seq >= draftConfirmedSeq) {
+        draftFailedSeq = seq;
+        showDraftSaveFailed(true);
+      }
       throw error;
     },
   );
@@ -702,6 +713,10 @@ function draftTimerIdle() {
 // holds, by identity or by the artifact's replace-key, keeps this tab's version.
 function adoptStoredDrafts() {
   if (sessionData.initialEnded) return 0;
+  // A terminal reservation restored from storage froze its batch before this page booted; a note
+  // adopted now would land outside that batch and be unsendable while the reservation holds. The
+  // record stays whole on the server for a load after the batch resolves.
+  if (terminalSubmission) return 0;
   const present = new Set(queued.map(promptIdentity).filter(Boolean));
   const queueKeys = new Set(
     queued.map((prompt) => prompt?.[internalQueueKeyField]).filter((value) => typeof value === "string" && value),

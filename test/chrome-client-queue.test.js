@@ -1645,6 +1645,59 @@ test("reload restores a completed terminal reservation after its prompt was deli
   assert.equal(reloaded.element("sendAndEnd").disabled, true);
 });
 
+// Regression: a tab that reloads while its terminal batch is reserved must not adopt other tabs'
+// unsent notes - they would land outside the frozen batch, unsendable while the reservation
+// holds, and be stranded if the retry then ends the session.
+test("a restored terminal reservation leaves other tabs' draft records for a later load", async () => {
+  const storage = new Map([["lavish-axi:terminal:abc", "true"]]);
+  const sessionData = {
+    ...defaultSessionData,
+    initialDrafts: [
+      {
+        tab: "otherTab",
+        seq: 4,
+        queue: [{ prompt: "Their note", selector: "p", tag: "p", prompt_id: "their-1" }],
+        review_state: null,
+        updated_at: "2026-11-09T10:00:00.000Z",
+      },
+    ],
+  };
+  const chrome = await createChromeHarness({
+    storage,
+    storedQueue: [
+      { uid: "", prompt: "Ending note", selector: "h1", tag: "element", text: "Heading", prompt_id: "end-1" },
+    ],
+    sessionData,
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return { ok: false, status: 409, json: async () => ({ warnings: [warningPayload()] }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt_id),
+    ["end-1"],
+    "the frozen terminal batch is restored alone",
+  );
+  assert.equal(chrome.draftRequests.length, 0, "no write claims the other tab's record while the batch holds");
+
+  chrome.element("sendAndEnd").click();
+  chrome.sendSnapshot("");
+  await flushPromises();
+  await flushPromises();
+  assert.equal(storage.has("lavish-axi:terminal:abc"), false, "the rejected batch releases the reservation");
+
+  const reloaded = await createChromeHarness({ storage, sessionData });
+  await flushPromises();
+  assert.deepEqual(
+    reloaded.queued().map((prompt) => prompt.prompt_id),
+    ["end-1", "their-1"],
+    "the record is adopted once no frozen batch holds the queue",
+  );
+});
+
 test("a recoverable terminal layout conflict restores ordinary review controls", async () => {
   const prompt = {
     uid: "",
@@ -10139,6 +10192,33 @@ test("a hide flush that overlaps an in-flight save is sent with a newer sequence
   chrome.setVisibility("hidden");
   await flushPromises();
   assert.equal(chrome.draftRequests.length, sent, "the flush itself was confirmed");
+});
+
+// Regression: an in-flight save settling after a newer hide flush failed must not clear the
+// banner that failure raised - the newest notes are still only in this tab.
+test("an older confirmed save does not clear the banner a newer failed save raised", async () => {
+  /** @type {(value: any) => void} */
+  let release = () => {};
+  const chrome = await createChromeHarness({
+    // The in-flight save's response is held back; the hide flush that overlaps it fails.
+    draftResponses: [new Promise((resolve) => (release = resolve)), { ok: false, status: 503, json: async () => ({}) }],
+  });
+  const banner = chrome.element("draftSaveBanner");
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "One", selector: "h1", tag: "h1" } });
+  await flushPromises();
+  chrome.setVisibility("hidden");
+  await flushPromises();
+  assert.equal(chrome.draftRequests.length, 2, "the flush does not wait for the in-flight save");
+  assert.equal(banner.hidden, false, "the failed flush leaves the newest notes only in this tab");
+
+  release({ ok: true, json: async () => ({}) });
+  for (let i = 0; i < 4; i += 1) await flushPromises();
+  assert.equal(banner.hidden, false, "the older save's ok response proves nothing about the newer body");
+
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "Two", selector: "p", tag: "p" } });
+  for (let i = 0; i < 4; i += 1) await flushPromises();
+  assert.equal(chrome.draftRequests.length, 3, "the next change retries");
+  assert.equal(banner.hidden, true, "the retry's confirmed save clears it");
 });
 
 test("a reload keeps the tab's draft record; a duplicated tab gets its own and adopts the original's", async () => {
